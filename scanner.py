@@ -38,12 +38,7 @@ SMTP_HOST = "smtp.gmail.com"
 SMTP_PORT = 465
 
 # ---------------------------------------------------------------------------
-# Nifty 100 universe (Yahoo Finance suffix = .NS)
-# Refresh quarterly from
-# https://www.niftyindices.com/indices/equity/broad-based-indices/nifty100
-#
-# CHANGED 2026-05: LTIM -> LTM (rename Feb 2026)
-# CHANGED 2025-10: TATAMOTORS -> TMPV (demerger, parent renamed to TMPV)
+# Nifty 100 universe
 # ---------------------------------------------------------------------------
 NIFTY_100 = [
     "ABB", "ADANIENSOL", "ADANIENT", "ADANIGREEN", "ADANIPORTS", "ADANIPOWER",
@@ -55,16 +50,16 @@ NIFTY_100 = [
     "HAVELLS", "HEROMOTOCO", "HINDALCO", "HAL", "HINDUNILVR", "HYUNDAI", "ICICIBANK",
     "ICICIGI", "ICICIPRULI", "ITC", "INDHOTEL", "IOC", "IRFC", "INDUSINDBK",
     "NAUKRI", "INFY", "INDIGO", "JSWENERGY", "JSWSTEEL", "JINDALSTEL", "JIOFIN",
-    "KOTAKBANK", "LTM", "LT", "LICI", "LODHA", "M&M", "MARUTI", "NTPC",          # CHANGED: LTIM -> LTM
+    "KOTAKBANK", "LTM", "LT", "LICI", "LODHA", "M&M", "MARUTI", "NTPC",
     "NESTLEIND", "ONGC", "PIDILITIND", "PFC", "POWERGRID", "PNB", "RECLTD",
     "RELIANCE", "SBILIFE", "MOTHERSON", "SHREECEM", "SHRIRAMFIN", "SIEMENS",
-    "SBIN", "SUNPHARMA", "SWIGGY", "TVSMOTOR", "TCS", "TATACONSUM", "TMPV",      # CHANGED: TATAMOTORS -> TMPV
+    "SBIN", "SUNPHARMA", "SWIGGY", "TVSMOTOR", "TCS", "TATACONSUM", "TMPV",
     "TATAPOWER", "TATASTEEL", "TECHM", "TITAN", "TORNTPHARM", "TRENT", "ULTRACEMCO",
     "UNITDSPR", "VBL", "VEDL", "WIPRO", "ZYDUSLIFE", "INDUSTOWER",
 ]
 
 # ---------------------------------------------------------------------------
-# Market hours (NSE: 09:15 - 15:30 IST, Mon-Fri)
+# Market hours
 # ---------------------------------------------------------------------------
 def is_market_open(now: Optional[dt.datetime] = None) -> bool:
     now = now or dt.datetime.now(tz=IST)
@@ -77,26 +72,15 @@ def is_market_open(now: Optional[dt.datetime] = None) -> bool:
 # ---------------------------------------------------------------------------
 # Data fetch
 # ---------------------------------------------------------------------------
-# NEW: distinguish "symbol is dead" from "transient Yahoo error" so we can
-# surface dead symbols clearly in the run summary instead of silently zeroing
-# them out.
 DELISTED_HINTS = ("possibly delisted", "no price data found",
                   "Quote not found", "No data found")
 
 def fetch_ticker_snapshot(symbol: str) -> Tuple[Optional[Dict], Optional[str]]:
-    """Return (snapshot_or_None, error_kind_or_None).
-
-    error_kind values:
-      - None       : success
-      - "DEAD"     : symbol clearly no longer exists on Yahoo (404 / delisted)
-      - "TRANSIENT": some other failure (network, parse, rate-limit)
-    """
     try:
         t = yf.Ticker(f"{symbol}.NS")
         last = hi52 = lo52 = 0.0
         vol  = 0
 
-        # Path 1: fast_info
         try:
             fi = t.fast_info
             last = float(fi.get("last_price") or 0)
@@ -106,7 +90,6 @@ def fetch_ticker_snapshot(symbol: str) -> Tuple[Optional[Dict], Optional[str]]:
         except Exception:
             pass
 
-        # Path 2: history fallback
         if not (last and hi52 and lo52):
             try:
                 hist = t.history(period="1y", interval="1d", auto_adjust=False)
@@ -117,8 +100,6 @@ def fetch_ticker_snapshot(symbol: str) -> Tuple[Optional[Dict], Optional[str]]:
                 return None, "TRANSIENT"
 
             if hist is None or hist.empty:
-                # yfinance prints "possibly delisted" to stderr in this path
-                # without raising. Treat empty history as DEAD.
                 return None, "DEAD"
 
             last = float(hist["Close"].iloc[-1])
@@ -131,12 +112,8 @@ def fetch_ticker_snapshot(symbol: str) -> Tuple[Optional[Dict], Optional[str]]:
             return None, "DEAD"
 
         return {
-            "symbol": symbol,
-            "last":   last,
-            "high52": hi52,
-            "low52":  lo52,
-            "volume": vol,
-            "ticker": t,
+            "symbol": symbol, "last": last, "high52": hi52,
+            "low52": lo52, "volume": vol, "ticker": t,
         }, None
 
     except Exception as e:
@@ -174,17 +151,13 @@ def classify(snap: Dict, prox: float) -> Optional[str]:
     return None
 
 
-# CHANGED: now also returns lists of dead/transient symbols for the run summary.
 def scan_universe(symbols: List[str], prox: float
                   ) -> Tuple[List[Dict], List[str], List[str]]:
     hits, dead, transient = [], [], []
     for sym in symbols:
         snap, err = fetch_ticker_snapshot(sym)
         if snap is None:
-            if err == "DEAD":
-                dead.append(sym)
-            else:
-                transient.append(sym)
+            (dead if err == "DEAD" else transient).append(sym)
             continue
         kind = classify(snap, prox)
         if kind:
@@ -197,7 +170,8 @@ def scan_universe(symbols: List[str], prox: float
 # ---------------------------------------------------------------------------
 # Email rendering
 # ---------------------------------------------------------------------------
-def render_html(hits: List[Dict], mock: bool, dead: List[str]) -> str:
+def render_html(hits: List[Dict], mock: bool, dead: List[str],
+                transient_count: int, scanned: int) -> str:                  # CHANGED signature
     now_ist = dt.datetime.now(tz=IST).strftime("%Y-%m-%d %H:%M IST")
     highs = [h for h in hits if h["kind"] == "HIGH"]
     lows  = [h for h in hits if h["kind"] == "LOW"]
@@ -241,17 +215,29 @@ def render_html(hits: List[Dict], mock: bool, dead: List[str]) -> str:
         </div>
         """
 
-    body = ""
-    if highs:
-        body += f'<h3 style="color:#2ecc71;margin:18px 0 4px;">🚀 52-Week HIGH breakouts ({len(highs)})</h3>'
-        body += "".join(row(h) for h in highs)
-    if lows:
-        body += f'<h3 style="color:#e74c3c;margin:18px 0 4px;">🔻 52-Week LOW breakouts ({len(lows)})</h3>'
-        body += "".join(row(h) for h in lows)
+    # NEW: heartbeat layout when no hits — small, scannable, distinguishable.
     if not hits:
-        body = '<p style="color:#888;font-style:italic;">No breakouts detected this cycle.</p>'
+        body = f"""
+        <div style="background:#eef5ff;border:1px solid #cfe0fb;border-radius:6px;
+                    padding:14px 18px;margin:8px 0;font-size:14px;color:#1f3b6e;">
+          ✅ <b>Heartbeat — pipeline is alive.</b><br>
+          Scanned {scanned} symbols, found <b>0</b> breakouts at 52-week extremes
+          (proximity = {PROXIMITY}).
+          <div style="color:#5a7099;margin-top:6px;font-size:12px;">
+            This message confirms GitHub Actions is firing on schedule.
+            No action needed.
+          </div>
+        </div>
+        """
+    else:
+        body = ""
+        if highs:
+            body += f'<h3 style="color:#2ecc71;margin:18px 0 4px;">🚀 52-Week HIGH breakouts ({len(highs)})</h3>'
+            body += "".join(row(h) for h in highs)
+        if lows:
+            body += f'<h3 style="color:#e74c3c;margin:18px 0 4px;">🔻 52-Week LOW breakouts ({len(lows)})</h3>'
+            body += "".join(row(h) for h in lows)
 
-    # NEW: surface dead symbols in the email so you know to update the universe.
     dead_block = ""
     if dead:
         dead_block = (
@@ -262,18 +248,29 @@ def render_html(hits: List[Dict], mock: bool, dead: List[str]) -> str:
             'Update <code>NIFTY_100</code> in scanner.py.</div>'
         )
 
+    transient_block = ""
+    if transient_count:
+        transient_block = (
+            '<div style="background:#f4f4f4;border:1px solid #ddd;'
+            'padding:6px 10px;border-radius:4px;margin-top:8px;font-size:11px;color:#666;">'
+            f'ℹ️ {transient_count} transient fetch errors (will retry next cycle).</div>'
+        )
+
     banner = ('<div style="background:#fff3cd;border:1px solid #ffeaa7;'
               'padding:8px 12px;border-radius:4px;margin-bottom:12px;'
               'font-size:13px;">🧪 <b>MOCK RUN</b> — wiring test, not a live alert.</div>'
               if mock else "")
 
+    title = "📈 NSE 100 Breakout Alert" if hits else "💓 NSE 100 Scan — Heartbeat"
+
     return f"""\
 <!DOCTYPE html><html><body style="font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:#222;max-width:720px;margin:0 auto;padding:16px;">
   {banner}
-  <h2 style="margin:0 0 4px;">📈 NSE 100 Breakout Alert</h2>
+  <h2 style="margin:0 0 4px;">{title}</h2>
   <div style="color:#888;font-size:13px;margin-bottom:8px;">{now_ist}</div>
   {body}
   {dead_block}
+  {transient_block}
   <hr style="border:none;border-top:1px solid #eee;margin:24px 0 8px;">
   <div style="color:#aaa;font-size:11px;">
     Sent by NSE Breakout Bot · data: Yahoo Finance · scheduled by GitHub Actions
@@ -281,17 +278,21 @@ def render_html(hits: List[Dict], mock: bool, dead: List[str]) -> str:
 </body></html>"""
 
 
-def render_text(hits: List[Dict], mock: bool, dead: List[str]) -> str:
+def render_text(hits: List[Dict], mock: bool, dead: List[str],
+                transient_count: int, scanned: int) -> str:                  # CHANGED signature
     now_ist = dt.datetime.now(tz=IST).strftime("%Y-%m-%d %H:%M IST")
     lines = []
     if mock:
         lines.append("[MOCK RUN] — wiring test, not a live alert.")
-    lines.append(f"NSE 100 Breakout Alert — {now_ist}")
-    lines.append("=" * 60)
 
     if not hits:
-        lines.append("No breakouts detected this cycle.")
+        lines.append(f"NSE 100 Scan — Heartbeat — {now_ist}")
+        lines.append("=" * 60)
+        lines.append(f"Pipeline alive. Scanned {scanned} symbols, 0 breakouts.")
+        lines.append("(GitHub Actions cron is firing on schedule.)")
     else:
+        lines.append(f"NSE 100 Breakout Alert — {now_ist}")
+        lines.append("=" * 60)
         for kind, label in [("HIGH", "52-Week HIGH"), ("LOW", "52-Week LOW")]:
             items = [h for h in hits if h["kind"] == kind]
             if not items:
@@ -311,26 +312,29 @@ def render_text(hits: List[Dict], mock: bool, dead: List[str]) -> str:
     if dead:
         lines.append("")
         lines.append(f"[!] Stale tickers ({len(dead)}): " + ", ".join(dead))
-        lines.append("    These returned 404. Likely renamed / delisted —")
-        lines.append("    update NIFTY_100 in scanner.py.")
+    if transient_count:
+        lines.append(f"[i] {transient_count} transient errors (retry next cycle).")
     return "\n".join(lines)
 
 
+# CHANGED: subject lines now make heartbeat vs alert obvious for filtering.
 def build_subject(hits: List[Dict], mock: bool) -> str:
     prefix = "[MOCK] " if mock else ""
     if not hits:
-        return f"{prefix}NSE 100 Breakout Scan — no hits"
+        # Heartbeat tag — easy to filter / auto-archive.
+        return f"{prefix}[NSE-Heartbeat] Pipeline alive — no breakouts"
     highs = sum(1 for h in hits if h["kind"] == "HIGH")
     lows  = sum(1 for h in hits if h["kind"] == "LOW")
     parts = []
     if highs: parts.append(f"{highs} 52w-HIGH")
     if lows:  parts.append(f"{lows} 52w-LOW")
-    return f"{prefix}NSE 100 Breakout: {', '.join(parts)}"
+    return f"{prefix}[NSE-Alert] {', '.join(parts)}"
 
 # ---------------------------------------------------------------------------
 # Send via Gmail SMTP
 # ---------------------------------------------------------------------------
-def send_email(hits: List[Dict], mock: bool, dead: List[str]) -> bool:
+def send_email(hits: List[Dict], mock: bool, dead: List[str],
+               transient_count: int, scanned: int) -> bool:                  # CHANGED signature
     if not (GMAIL_USER and GMAIL_APP_PASSWORD and EMAIL_TO):
         print("[ERROR] GMAIL_USER / GMAIL_APP_PASSWORD / EMAIL_TO not set",
               file=sys.stderr)
@@ -340,15 +344,17 @@ def send_email(hits: List[Dict], mock: bool, dead: List[str]) -> bool:
     msg["Subject"] = build_subject(hits, mock)
     msg["From"]    = GMAIL_USER
     msg["To"]      = EMAIL_TO
-    msg.set_content(render_text(hits, mock, dead))
-    msg.add_alternative(render_html(hits, mock, dead), subtype="html")
+    msg.set_content(render_text(hits, mock, dead, transient_count, scanned))
+    msg.add_alternative(render_html(hits, mock, dead, transient_count, scanned),
+                        subtype="html")
 
     try:
         ctx = ssl.create_default_context()
         with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=ctx, timeout=20) as s:
             s.login(GMAIL_USER, GMAIL_APP_PASSWORD.replace(" ", ""))
             s.send_message(msg)
-        print(f"Email sent to {EMAIL_TO}")
+        kind = "alert" if hits else "heartbeat"
+        print(f"Email ({kind}) sent to {EMAIL_TO}")
         return True
     except Exception as e:
         print(f"[ERROR] SMTP: {e}", file=sys.stderr)
@@ -362,21 +368,19 @@ def main() -> int:
         print("Market closed - exiting without scan.")
         return 0
 
-    print(f"Scanning {len(NIFTY_100)} symbols (proximity={PROXIMITY})...")
+    scanned = len(NIFTY_100)
+    print(f"Scanning {scanned} symbols (proximity={PROXIMITY})...")
     hits, dead, transient = scan_universe(NIFTY_100, PROXIMITY)
 
-    # NEW: clear summary at the end of the log
     print("=" * 50)
     print(f"Breakouts:        {len(hits)}")
     print(f"Stale (404/dead): {len(dead)}  {dead if dead else ''}")
     print(f"Transient errors: {len(transient)}  {transient if transient else ''}")
     print("=" * 50)
 
-    if not hits and not MOCK_RUN:
-        print("No breakouts -> skipping email (per requirement #7).")
-        return 0
-
-    ok = send_email(hits, mock=MOCK_RUN, dead=dead)
+    # CHANGED: always send. Heartbeat when 0 hits, full alert when there are.
+    ok = send_email(hits, mock=MOCK_RUN, dead=dead,
+                    transient_count=len(transient), scanned=scanned)
     return 0 if ok else 1
 
 
